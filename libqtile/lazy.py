@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import Dict, List, Optional, Tuple, Union  # noqa: F401
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple, Union, Callable  # noqa: F401
 
 from libqtile.command_client import InteractiveCommandClient
 from libqtile.command_graph import (
@@ -46,8 +47,9 @@ class LazyCall:
         self._args = args
         self._kwargs = kwargs
 
-        self._layout = None  # type: Optional[str]
+        self._layout_rules = defaultdict(dict)
         self._when_floating = True
+        self._filter = self._default_filter
 
     @property
     def selectors(self) -> List[SelectorType]:
@@ -70,35 +72,80 @@ class LazyCall:
         return self._kwargs
 
     def when(self, layout: Optional[str] = None,
-             when_floating: bool = True) -> 'LazyCall':
+             when_floating: bool = True,
+             filt: Optional[Callable[['Qtile'], bool]] = None) -> 'LazyCall':
         """Filter call activation per layout or floating state
 
         Parameters
         ----------
         layout : str or None
-            Restrict call to given layout name. If None, call for all layouts.
-            If 'floating', call if, and only if the current window is floating,
-            ``when_floating`` is ignored in this case.
+            Restrict call to given layout name.
         when_floating : bool
             Call if the current window is floating.
+        filt : callable(qtile object) -> bool
+            Arbitrary predicate called with the Qtile object. The
+            result is and-ed with `when_floating`.
+
+        When `layout` is not ``None``, `when_floating` and `filt`
+        apply only to that layout.
+
+        Multiple calls to this method can be chained to add multiple
+        per-layout rules or change global defaults.
+
+        Examples
+        --------
+        .. code-block:: python
+            # evaluate command only in "columns" and "monadtall" layouts
+            cmd.when(layout="columns").when(layout="monadtall")
+
+            # same as above, but do not evaluate if the
+            # current window is floating in "columns" layout
+            cmd.when(layout="columns", when_floating=False)\
+                .when(layout="monadtall")
+
+            # never evaluate if the current window is floating
+            cmd.when(when_floating=False)
+
+            # evaluate only in group "a"
+            cmd.when(filt=lambda q: q.current_group.name == 'a')
+
+            # evaluate only in "columns" layout when in group "a"
+            # and in "monadtall" layout (any group)
+            cmd.when(layout="columns",
+                     filt=lambda q: q.current_group.name == 'a') \
+                .when(layout="monadtall")
         """
-        self._layout = layout
-        self._when_floating = when_floating
+        if layout is not None:
+            self._layout_rules[layout]["when_floating"] = when_floating
+            self._layout_rules[layout]["filter"] = filt or (lambda q: True)
+        else:
+            self._when_floating = when_floating
+            self._filter = filt or self._default_filter
         return self
 
     def check(self, q) -> bool:
-        cur_win_floating = q.current_window and q.current_window.floating
+        cur_layout = q.current_layout.name
 
-        if self._layout == 'floating':  # ignore _when_floating
-            return cur_win_floating
+        # floating window
+        if q.current_window and q.current_window.floating:
+            if cur_layout in self._layout_rules:
+                return self._layout_rules[cur_layout]["when_floating"] and \
+                    self._layout_rules[cur_layout]["filter"](q)
+            else:
+                return self._when_floating and self._filter(q)
 
-        if cur_win_floating and not self._when_floating:
-            return False
+        # per-layout rules
+        if cur_layout in self._layout_rules:
+            return self._layout_rules[cur_layout]["filter"](q)
 
-        if self._layout and q.current_layout.name != self._layout:
-            return False
+        # no rule, apply the global filter:
+        # defaults to rejecting if some rules are set
+        # but current layout is not explicitly allowed
+        return self._filter(q)
 
-        return True
+    def _default_filter(self, q) -> bool:
+        return not (self._layout_rules and
+                    q.current_layout.name not in self._layout_rules)
 
 
 class LazyCommandObject(CommandInterface):
